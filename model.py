@@ -209,4 +209,3 @@ class RNAProteinInteractionModel(nn.Module):
         """
         proba = self.predict_proba(rna_seq, protein_seq)
         return (proba >= threshold).long()
-
