@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual envs
+.env/
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model checkpoints
+genechat_checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# Dataset folders
+Train/
+Test/
+data/
+datasets/
+
+# Cache / temp
+*.cache
+*.log
+*.tmp
+
+# OS / IDE stuff
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Large artifacts
+*.png
+*.jpg
+*.jpeg
+*.svg
+
