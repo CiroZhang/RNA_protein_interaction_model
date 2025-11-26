@@ -11,7 +11,6 @@ venv/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
 # Model checkpoints
 genechat_checkpoints/
