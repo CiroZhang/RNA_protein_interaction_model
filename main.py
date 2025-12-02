@@ -11,11 +11,21 @@ from torch.amp import autocast, GradScaler
 from contextlib import nullcontext
 
 from dataset import read_data, GeneSummaryDataset, collate_fn
-from genechat_model import GeneChatModel
+from genechat_model import (
+    GeneChatModel,
+    DNABERTBartDecoder,
+    DNABERTT5Decoder,
+    DNABERTGRUDecoder,
+    RandomSummaryBaseline,
+)
 
-# ---------------------------------------------------------
-# Device setup
-# ---------------------------------------------------------
+###########################################################################
+# SELECT WHICH MODEL TO TRAIN
+###########################################################################
+# Options: "genechat", "bart", "t5", "gru", "random"
+MODEL_NAME = "genechat"
+###########################################################################
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 use_amp = device == "cuda"
 
@@ -28,96 +38,147 @@ print(f"Total train entries: {len(train_data)}")
 train, val = train_test_split(train_data, test_size=0.05, random_state=42)
 print(f"Train split: {len(train)}   Val split: {len(val)}\n")
 
-# ---------------------------------------------------------
-# Model
-# ---------------------------------------------------------
-print(">>> Building model (DNABERT + GPT-2)...")
-model = GeneChatModel(
-    gene_chunk_nt=512,
-    gene_chunk_overlap=0,
-    freeze_gene_encoder=True,
-).to(device)
-print("Model built.\n")
+###########################################################################
+# Build selected model
+###########################################################################
+print(f">>> Building model: {MODEL_NAME}")
 
-# ---------------------------------------------------------
-# Freeze / unfreeze GPT-2 parts
-#   - Freeze all GPT-2 by default
-#   - Unfreeze last 6 transformer blocks + lm_head
-#   - Always train gene_adaptor
-# ---------------------------------------------------------
-for p in model.lm.parameters():
-    p.requires_grad = False
+if MODEL_NAME == "genechat":
+    model = GeneChatModel(
+        gene_chunk_nt=512,
+        gene_chunk_overlap=0,
+        freeze_gene_encoder=True,
+    ).to(device)
 
-# unfreeze last 6 transformer blocks (if there are that many)
-num_blocks = len(model.lm.transformer.h)
-unfreeze_k = min(6, num_blocks)
-top_blocks = list(model.lm.transformer.h[-unfreeze_k:])
-for blk in top_blocks:
-    for p in blk.parameters():
+elif MODEL_NAME == "bart":
+    model = DNABERTBartDecoder(
+        gene_chunk_nt=512,
+        gene_chunk_overlap=0,
+        freeze_gene_encoder=True,
+    ).to(device)
+
+elif MODEL_NAME == "t5":
+    model = DNABERTT5Decoder(
+        gene_chunk_nt=512,
+        gene_chunk_overlap=0,
+        freeze_gene_encoder=True,
+    ).to(device)
+
+elif MODEL_NAME == "gru":
+    model = DNABERTGRUDecoder(
+        gene_chunk_nt=512,
+        gene_chunk_overlap=0,
+        freeze_gene_encoder=True,
+    ).to(device)
+
+elif MODEL_NAME == "random":
+    model = RandomSummaryBaseline(train_data).to(device)
+
+else:
+    raise ValueError("Invalid MODEL_NAME")
+
+print(">>> Model built.\n")
+
+
+###########################################################################
+# PARAMETER FREEZING / OPTIMIZATION SETUP
+###########################################################################
+
+if MODEL_NAME == "genechat":
+
+    print(">>> Configuring GPT-2 freeze/unfreeze...")
+
+    # freeze GPT-2 entire model
+    for p in model.lm.parameters():
+        p.requires_grad = False
+
+    # unfreeze last 6 blocks
+    num_blocks = len(model.lm.transformer.h)
+    unfreeze_k = min(6, num_blocks)
+    top_blocks = list(model.lm.transformer.h[-unfreeze_k:])
+    for blk in top_blocks:
+        for p in blk.parameters():
+            p.requires_grad = True
+
+    # unfreeze lm_head
+    for p in model.lm.lm_head.parameters():
         p.requires_grad = True
 
-# unfreeze lm_head
-for p in model.lm.lm_head.parameters():
-    p.requires_grad = True
+    # gene adapter always trainable
+    for p in model.gene_adaptor.parameters():
+        p.requires_grad = True
 
-# gene_adaptor always trainable
-for p in model.gene_adaptor.parameters():
-    p.requires_grad = True
+    # optimizer setup
+    adaptor_params = list(model.gene_adaptor.parameters())
 
-# ---------------------------------------------------------
-# Dataset + Dataloaders
-# ---------------------------------------------------------
+    gpt2_top_params = []
+    for blk in top_blocks:
+        gpt2_top_params.extend(list(blk.parameters()))
+    gpt2_top_params.extend(list(model.lm.lm_head.parameters()))
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": adaptor_params, "lr": 1e-4},
+            {"params": gpt2_top_params, "lr": 5e-5},
+        ]
+    )
+
+elif MODEL_NAME in ["bart", "t5"]:
+
+    print(">>> Using seq2seq model training.")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+elif MODEL_NAME == "gru":
+
+    print(">>> Using custom GRU decoder training.")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+elif MODEL_NAME == "random":
+
+    print(">>> Random summary model: no training needed.")
+    # Dummy optimizer to keep loop clean
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+else:
+    raise ValueError("Invalid MODEL_NAME")
+
+
+###########################################################################
+# Dataset + loaders
+###########################################################################
+
 train_ds = GeneSummaryDataset(train)
 val_ds   = GeneSummaryDataset(val)
 
-num_workers = 8
-pin_mem = device == "cuda"
-
 train_loader = DataLoader(
     train_ds,
-    batch_size=4,
+    batch_size=1 if MODEL_NAME in ["bart","t5"] else 4,
     shuffle=True,
     collate_fn=collate_fn,
-    num_workers=num_workers,
-    pin_memory=pin_mem,
+    num_workers=4,
+    pin_memory=(device=="cuda"),
 )
+
 val_loader = DataLoader(
     val_ds,
-    batch_size=4,
+    batch_size=1 if MODEL_NAME in ["bart","t5"] else 4,
     shuffle=False,
     collate_fn=collate_fn,
-    num_workers=num_workers,
-    pin_memory=pin_mem,
+    num_workers=4,
+    pin_memory=(device=="cuda"),
 )
 
 print(f"Train batches: {len(train_loader)}")
 print(f"Val batches:   {len(val_loader)}\n")
 
-# ---------------------------------------------------------
-# Optimizer + AMP scaler
-#   - Higher LR for adapter
-#   - Lower LR for GPT-2 top layers
-# ---------------------------------------------------------
-adaptor_params = list(model.gene_adaptor.parameters())
 
-gpt2_top_params = []
-for blk in top_blocks:
-    gpt2_top_params.extend(list(blk.parameters()))
-gpt2_top_params.extend(list(model.lm.lm_head.parameters()))
-
-optimizer = torch.optim.AdamW(
-    [
-        {"params": adaptor_params, "lr": 1e-4},
-        {"params": gpt2_top_params, "lr": 5e-5},
-    ]
-)
+###########################################################################
+# Training routines
+###########################################################################
 
 scaler = GradScaler("cuda") if use_amp else None
 
-# ---------------------------------------------------------
-# Training / eval functions
-# ---------------------------------------------------------
-def run_one_epoch(loader, train: bool = True) -> float:
+def run_one_epoch(loader, train=True):
     if train:
         model.train()
         desc = "Training"
@@ -126,7 +187,7 @@ def run_one_epoch(loader, train: bool = True) -> float:
         desc = "Validating"
 
     total_loss = 0.0
-    pbar = tqdm(loader, desc=desc, ncols=110)
+    pbar = tqdm(loader, desc=f"{desc} ({MODEL_NAME})", ncols=120)
 
     for dna_list, tgt_list in pbar:
         batch_loss = 0.0
@@ -135,13 +196,14 @@ def run_one_epoch(loader, train: bool = True) -> float:
         if train:
             optimizer.zero_grad(set_to_none=True)
 
+        # loop through items since all baselines use .forward_single(dna, target)
         for dna, target in zip(dna_list, tgt_list):
             ctx = autocast("cuda", dtype=torch.float16) if use_amp else nullcontext()
             with ctx:
                 loss = model.forward_single(dna, target, device=device)
-            batch_loss = batch_loss + loss
+            batch_loss += loss
 
-        batch_loss = batch_loss / B
+        batch_loss /= B
 
         if train:
             if use_amp:
@@ -156,25 +218,38 @@ def run_one_epoch(loader, train: bool = True) -> float:
 
         total_loss += batch_loss.item()
         avg_loss = total_loss / (pbar.n + 1)
-        pbar.set_postfix({"batch_loss": batch_loss.item(), "avg_loss": f"{avg_loss:.4f}"})
+
+        pbar.set_postfix({"batch": batch_loss.item(), "avg": f"{avg_loss:.4f}"})
 
     return total_loss / len(loader)
 
-# ---------------------------------------------------------
-# Training Loop with early stopping
-# ---------------------------------------------------------
-best_val = float("inf")
-best_path = "genechat_checkpoints/model_best.pt"
-final_path = "genechat_checkpoints/model_final.pt"
-os.makedirs("genechat_checkpoints", exist_ok=True)
 
+###########################################################################
+# Training loop
+###########################################################################
+
+# file naming
+ckpt_dir = f"checkpoints_{MODEL_NAME}"
+os.makedirs(ckpt_dir, exist_ok=True)
+
+best_path = f"{ckpt_dir}/best.pt"
+final_path = f"{ckpt_dir}/final.pt"
+
+best_val = float("inf")
 patience = 3
 no_improve = 0
-max_epochs = 12  # more epochs now that we partially unfreeze GPT-2
+max_epochs = 8 if MODEL_NAME != "genechat" else 12
 
 print("\n====================")
-print("  START TRAINING")
+print(f"  START TRAINING: {MODEL_NAME}")
 print("====================\n")
+
+# random baseline does not need training — exit early
+if MODEL_NAME == "random":
+    print("Random baseline: training skipped.\n")
+    torch.save(model.state_dict(), final_path)
+    print(f"Saved: {final_path}")
+    exit()
 
 for epoch in range(1, max_epochs + 1):
     print(f"\n===== Epoch {epoch} =====")
@@ -186,6 +261,7 @@ for epoch in range(1, max_epochs + 1):
     print(f"  Train loss: {train_loss:.4f}")
     print(f"  Val   loss: {val_loss:.4f}")
 
+    # Early stopping logic
     if val_loss < best_val - 1e-3:
         best_val = val_loss
         no_improve = 0
@@ -201,4 +277,5 @@ for epoch in range(1, max_epochs + 1):
 
 torch.save(model.state_dict(), final_path)
 print(f"\n>>> Saved FINAL model to {final_path}\n")
+
 
