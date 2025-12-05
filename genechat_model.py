@@ -53,6 +53,7 @@ class DNABERTEncoderMixin:
         self.gene_encoder = AutoModel.from_pretrained(
             gene_model_name,
             trust_remote_code=True,
+            use_safetensors=True,
         )
         self.gene_hidden_dim = self.gene_encoder.config.hidden_size
 
@@ -117,6 +118,136 @@ class DNABERTEncoderMixin:
         gene_vec = pooled.mean(dim=0)           # [gene_hidden_dim]
         gene_vec = self.gene_adaptor(gene_vec)  # [hidden_dim]
         return gene_vec
+
+
+######################################################################
+# 0. GeneChatModel: DNABERT + GPT-2 decoder
+######################################################################
+
+class GeneChatModel(nn.Module, DNABERTEncoderMixin):
+    """
+    DNABERT encoder + GPT-2 decoder.
+    DNA embedding is prepended to the prompt as a soft prefix.
+    """
+    def __init__(
+        self,
+        gene_model_name: str = "zhihan1996/DNA_bert_6",
+        lm_name: str = "gpt2",
+        gene_chunk_nt: int = 512,
+        gene_chunk_overlap: int = 0,
+        freeze_gene_encoder: bool = True,
+    ):
+        super().__init__()
+
+        # GPT-2 side
+        from transformers import AutoModelForCausalLM
+        self.txt_tok = AutoTokenizer.from_pretrained(lm_name)
+        if self.txt_tok.pad_token is None:
+            self.txt_tok.pad_token = self.txt_tok.eos_token
+
+        self.lm = AutoModelForCausalLM.from_pretrained(lm_name)
+        hidden_dim = self.lm.config.n_embd
+
+        # DNABERT encoder init
+        self._init_dnabert_encoder(
+            gene_model_name=gene_model_name,
+            gene_chunk_nt=gene_chunk_nt,
+            gene_chunk_overlap=gene_chunk_overlap,
+            freeze_gene_encoder=freeze_gene_encoder,
+            target_hidden_dim=hidden_dim,
+        )
+
+        # Prompt text
+        self.prompt_text = (
+            "You are an expert genomic annotation assistant.\n"
+            "Gene: [DNA]\n"
+            "Summary:"
+        )
+
+    def forward_single(self, dna: str, target: str, device: str):
+        """
+        Causal LM training:
+          input = gene embedding (soft prefix) + prompt + target
+          labels = mask prompt, only train on target tokens
+        """
+        # Encode gene
+        gene_vec = self.encode_gene_single(dna, device=device)  # [hidden_dim]
+        gene_emb = gene_vec.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
+
+        # Tokenize prompt + target
+        full_text = self.prompt_text + " " + target
+        enc = self.txt_tok(
+            full_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.lm.config.n_positions - 1,  # leave room for gene token
+        )
+        input_ids = enc.input_ids.to(device)  # [1, L]
+
+        # Get text embeddings
+        txt_emb = self.lm.transformer.wte(input_ids)  # [1, L, hidden_dim]
+
+        # Concatenate gene embedding + text embeddings
+        inputs_embeds = torch.cat([gene_emb, txt_emb], dim=1)  # [1, 1+L, hidden_dim]
+
+        # Build labels: -100 for gene + prompt, real tokens for target
+        prompt_len = len(self.txt_tok(self.prompt_text, add_special_tokens=False).input_ids)
+        labels = input_ids.clone()
+        labels[0, :prompt_len] = -100
+
+        # Shift labels and prepend -100 for gene token
+        labels = torch.cat([
+            torch.full((1, 1), -100, dtype=labels.dtype, device=device),
+            labels
+        ], dim=1)  # [1, 1+L]
+
+        # Forward pass
+        outputs = self.lm(
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+        )
+        return outputs.loss
+
+    def generate(
+        self,
+        dna: str,
+        device: str = "cpu",
+        max_new_tokens: int = 80,
+    ) -> str:
+        self.eval()
+        # Encode gene
+        gene_vec = self.encode_gene_single(dna, device=device)
+        gene_emb = gene_vec.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
+
+        # Tokenize prompt only
+        enc = self.txt_tok(
+            self.prompt_text,
+            return_tensors="pt",
+        )
+        input_ids = enc.input_ids.to(device)
+        txt_emb = self.lm.transformer.wte(input_ids)
+
+        # Concatenate gene + prompt embeddings
+        inputs_embeds = torch.cat([gene_emb, txt_emb], dim=1)
+
+        # Generate
+        gen_ids = self.lm.generate(
+            inputs_embeds=inputs_embeds,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            top_p=0.9,
+            temperature=0.7,
+            pad_token_id=self.txt_tok.pad_token_id,
+        )
+
+        # Decode (skip the prompt part)
+        full_text = self.txt_tok.decode(gen_ids[0], skip_special_tokens=True)
+        # Try to extract just the summary part after "Summary:"
+        if "Summary:" in full_text:
+            summary = full_text.split("Summary:")[-1].strip()
+        else:
+            summary = full_text.strip()
+        return summary
 
 
 ######################################################################

@@ -5,10 +5,10 @@ from torch.utils.data import Dataset
 
 
 def read_data(
-    train_seq_path="Train/seq.json",
-    train_summary_path="Train/qa_summary_rule.json",
-    test_seq_path="Test/seq.json",
-    test_summary_path="Test/qa_summary_rule.json",
+    train_seq_path="train/seq.json",
+    train_summary_path="train/qa_summary_rule.json",
+    test_seq_path="test/seq.json",
+    test_summary_path="test/qa_summary_rule.json",
 ):
     with open(train_seq_path) as f:
         train_seq = json.load(f)
